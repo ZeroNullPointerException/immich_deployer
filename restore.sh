@@ -326,8 +326,33 @@ fi
 echo "🔄 Redémarrage des services..."
 echo ""
 
-# Redémarrer tous les services
-docker compose up -d
+# Vérifier si les conteneurs existent déjà
+if docker ps -a --format '{{.Names}}' | grep -q "^immich_postgres$"; then
+    # Les conteneurs existent déjà - juste les redémarrer (pas de recréation)
+    echo "   Les conteneurs existent déjà, redémarrage sans recréation..."
+    
+    # Si on a restauré la configuration, on doit recréer (pour appliquer les changements)
+    if [ "$RESTORE_CONFIG" = true ]; then
+        echo "   ⚠️  Configuration restaurée - recréation des conteneurs si nécessaire..."
+        docker compose up -d --force-recreate
+    else
+        # Sinon, juste redémarrer les services arrêtés
+        if [ "$RESTORE_DB" = true ] || [ "$RESTORE_PHOTOS" = true ]; then
+            echo "   Redémarrage d'Immich server..."
+            docker compose restart immich-server
+        fi
+        
+        # Démarrer les services arrêtés sans recréation
+        docker compose up -d --no-recreate
+        
+        # Redémarrer les services qui étaient arrêtés
+        docker compose start 2>/dev/null || true
+    fi
+else
+    # Les conteneurs n'existent pas - création initiale
+    echo "   Les conteneurs n'existent pas - création initiale..."
+    docker compose up -d
+fi
 
 echo ""
 echo "⏳ Attente du démarrage des services (15 secondes)..."
