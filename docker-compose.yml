@@ -1,0 +1,259 @@
+version: '3.8'
+
+# Réseaux isolés
+networks:
+  immich_public:
+    driver: bridge
+  immich_private:
+    driver: bridge
+    internal: true  # Pas d'accès Internet direct
+
+volumes:
+  postgres_data:
+  redis_data:
+  model_cache:
+
+services:
+  # ============================================
+  # CADDY - Reverse Proxy avec HTTPS automatique
+  # ============================================
+  caddy:
+    image: caddy:2-alpine
+    container_name: immich_caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy_data:/data
+      - ./caddy_config:/config
+      - ./logs:/var/log/caddy
+    networks:
+      - immich_public
+    depends_on:
+      - immich-server
+    environment:
+      - DOMAIN=${DOMAIN:-photos.votredomaine.freeboxos.fr}
+    # Sécurité: Pas d'utilisateur non-root pour Caddy (nécessite ports < 1024)
+    security_opt:
+      - no-new-privileges:true
+    read_only: false  # Caddy doit écrire dans /data et /config pour les certificats
+
+  # ============================================
+  # IMMICH - Serveur Principal
+  # ============================================
+  immich-server:
+    container_name: immich_server
+    image: ghcr.io/immich-app/immich-server:release
+    restart: unless-stopped
+    volumes:
+      - ${UPLOAD_LOCATION}:/usr/src/app/upload
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      - immich_public
+      - immich_private
+    environment:
+      DB_HOSTNAME: postgres
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_DATABASE_NAME: ${DB_DATABASE_NAME}
+      REDIS_HOSTNAME: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      LOG_LEVEL: warn
+      # Sécurité
+      JWT_SECRET: ${JWT_SECRET}
+      # Performance
+      IMMICH_WORKERS_INCLUDE: 'api'
+    depends_on:
+      - redis
+      - postgres
+    # Sécurité: Restrictions supplémentaires
+    security_opt:
+      - no-new-privileges:true
+    # Limites de ressources pour sécurité
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # ============================================
+  # IMMICH - Microservices
+  # ============================================
+  immich-machine-learning:
+    container_name: immich_machine_learning
+    image: ghcr.io/immich-app/immich-machine-learning:release
+    restart: unless-stopped
+    volumes:
+      - model_cache:/cache
+    networks:
+      - immich_private
+    environment:
+      DB_HOSTNAME: postgres
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_DATABASE_NAME: ${DB_DATABASE_NAME}
+      REDIS_HOSTNAME: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      IMMICH_WORKERS_INCLUDE: 'machine-learning'
+    # Sécurité: Restrictions supplémentaires
+    security_opt:
+      - no-new-privileges:true
+    # Limites de ressources pour sécurité
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+
+  # ============================================
+  # POSTGRESQL - Base de données (ISOLÉE)
+  # ============================================
+  postgres:
+    container_name: immich_postgres
+    image: tensorchord/pgvecto-rs:pg14-v0.2.0
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - immich_private  # Réseau privé uniquement
+    environment:
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_DATABASE_NAME}
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+    command: >
+      postgres
+      -c shared_preload_libraries=vectors.so
+      -c 'search_path="$$user", public, vectors'
+      -c logging_collector=on
+      -c max_wal_size=2GB
+      -c shared_buffers=512MB
+      -c wal_compression=on
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${DB_DATABASE_NAME}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    # Sécurité: Restrictions supplémentaires
+    security_opt:
+      - no-new-privileges:true
+    # Limites de ressources pour sécurité
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+  # ============================================
+  # REDIS - Cache (ISOLÉ)
+  # ============================================
+  redis:
+    container_name: immich_redis
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    networks:
+      - immich_private  # Réseau privé uniquement
+    command: redis-server --requirepass ${REDIS_PASSWORD} --save 60 1 --loglevel warning --protected-mode yes
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      # redis-cli utilise automatiquement REDISCLI_AUTH si disponible
+      - REDISCLI_AUTH=${REDIS_PASSWORD}
+    # Sécurité: Restrictions supplémentaires
+    security_opt:
+      - no-new-privileges:true
+    # Healthcheck: utilise REDISCLI_AUTH pour l'authentification (plus sécurisé)
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ============================================
+  # WATCHTOWER - Mises à jour automatiques
+  # ============================================
+  watchtower:
+    container_name: immich_watchtower
+    image: containrrr/watchtower:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # Lecture seule pour sécurité
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_INCLUDE_RESTARTING=true
+      - WATCHTOWER_SCHEDULE=0 0 4 * * SUN  # Dimanche 4h du matin
+      - WATCHTOWER_NOTIFICATIONS=shoutrrr
+      - WATCHTOWER_NOTIFICATION_URL=${NOTIFICATION_URL}
+      - WATCHTOWER_POLL_INTERVAL=3600  # Vérifier toutes les heures
+      - WATCHTOWER_LABEL_ENABLE=true  # Surveiller uniquement les conteneurs avec label
+      - TZ=Europe/Paris
+    # Sécurité: Restrictions supplémentaires
+    security_opt:
+      - no-new-privileges:true
+    command: immich_server immich_machine_learning immich_postgres immich_redis
+    # Note: Accès au socket Docker nécessaire pour Watchtower, mais limité en lecture seule
+
+  # ============================================
+  # UPTIME KUMA - Monitoring (Optionnel)
+  # ============================================
+  uptime-kuma:
+    container_name: immich_uptime_kuma
+    image: louislam/uptime-kuma:1
+    restart: unless-stopped
+    volumes:
+      - ./uptime-kuma:/app/data
+    # ⚠️ SÉCURITÉ: Limité à localhost uniquement (plus sécurisé)
+    # Accessible uniquement depuis la machine serveur: http://localhost:3001
+    # Pour accéder depuis une autre machine, utilisez SSH tunnel ou reverse proxy
+    ports:
+      - "127.0.0.1:3001:3001"  # Localhost uniquement
+    networks:
+      - immich_public
+    profiles:
+      - monitoring  # Démarrer avec: docker compose --profile monitoring up -d
+    # Sécurité: Restrictions supplémentaires
+    security_opt:
+      - no-new-privileges:true
+    # Limites de ressources
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+
+  # ============================================
+  # FAIL2BAN - Protection Brute Force
+  # ============================================
+  fail2ban:
+    container_name: immich_fail2ban
+    image: crazymax/fail2ban:latest
+    restart: unless-stopped
+    network_mode: host  # Nécessaire pour modifier iptables
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ./fail2ban:/data
+      - ./logs:/var/log/caddy:ro  # Lecture seule
+    environment:
+      - TZ=Europe/Paris
+      - F2B_LOG_LEVEL=INFO
+      - F2B_DB_PURGE_AGE=30d
+    # Sécurité: Restrictions supplémentaires (malgré network_mode: host)
+    security_opt:
+      - no-new-privileges:true

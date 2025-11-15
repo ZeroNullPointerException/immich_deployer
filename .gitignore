@@ -1,0 +1,30 @@
+# Backups
+backups/
+*.tar.gz
+
+# Données photos (peuvent être volumineuses)
+data/
+
+# Configuration sensible
+.env
+
+# Logs
+logs/*.log
+
+# Docker volumes
+postgres_data/
+redis_data/
+model_cache/
+
+# Caddy
+caddy_data/
+caddy_config/
+
+# Fail2ban
+fail2ban/db/
+fail2ban/action.d/
+fail2ban/filter.d/
+
+# Uptime Kuma
+uptime-kuma/
+

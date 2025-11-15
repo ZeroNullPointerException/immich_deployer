@@ -1,0 +1,64 @@
+{
+    email vidal.alan.m@gmail.com
+    admin off
+    
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 10mb
+            roll_keep 5
+            roll_keep_for 720h
+        }
+        format json
+        level INFO
+    }
+}
+
+mytrix.freeboxos.fr {
+    header {
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        X-XSS-Protection "1; mode=block"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "geolocation=(), microphone=(), camera=(self)"
+        # CSP: 'unsafe-inline' et 'unsafe-eval' nécessaires pour Immich (React/JS moderne)
+        # Alternative plus stricte possible avec nonces, mais nécessite modifications app
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; media-src 'self' blob:; object-src 'none'; frame-ancestors 'self';"
+        -Server
+        -X-Powered-By
+    }
+
+    # Note: Rate limiting géré par Fail2ban
+    # Le module rate_limit nécessite une image Caddy personnalisée avec le module http.ratelimit
+    # Fail2ban fournit une protection efficace contre les attaques brute force
+
+    @uploads {
+        path /api/asset/upload
+    }
+    
+    reverse_proxy @uploads immich-server:2283 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+        
+        transport http {
+            read_timeout 30m
+            write_timeout 30m
+        }
+    }
+
+    reverse_proxy immich-server:2283 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+        
+        transport http {
+            read_timeout 5m
+            write_timeout 5m
+        }
+    }
+}
+
+http://mytrix.freeboxos.fr {
+    redir https://{host}{uri} permanent
+}
